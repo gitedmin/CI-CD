@@ -1,0 +1,118 @@
+variables:
+  GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by analysis task
+  PRODUCT_NAMESPACE: "test"
+  DEFAULT_DOCKER_REPO: "${DOCKER_NONPROD_REPO}"
+
+stages:
+  - releaseid
+  - export
+  - pullandexport
+
+ReleaseID:
+  #image: $DOCKER_REGISTRY/$DEFAULT_DOCKER_REPO/$MAVEN_IMAGE_TAG
+  stage: releaseid
+  script:
+    - echo Commit Branch :- ${CI_COMMIT_BRANCH}
+    # Defaulting ReleaseID to SNAPSNOT Version
+    - > 
+      if [ "${CI_COMMIT_BRANCH}" == "${PRODUCTION_BRANCH}" ]; then
+        export RELEASE_IDENIFIER='latest'
+        echo "Changing to Product Release Version :- ${RELEASE_IDENIFIER}"
+      elif [[ "${CI_COMMIT_BRANCH}" =~ ^release\/SIT.*$ ]]; then  
+          export RELEASE_IDENIFIER='RELEASE'
+          echo "Changing to RELEASE Version :- ${RELEASE_IDENIFIER}"
+      elif [[ "${CI_COMMIT_BRANCH}" =~ ^release\/UAT.*$ ]]; then
+          export RELEASE_IDENIFIER='RELEASE-BETA'
+          echo "Changing Version to RELEASE-BETA Version :- ${RELEASE_IDENIFIER}"  
+      elif [[ "${CI_COMMIT_BRANCH}" =~ ^test\/uat.*$ ]]; then
+          export RELEASE_IDENIFIER='TEST'
+          echo "Changing Version to RELEASE-BETA Version :- ${RELEASE_IDENIFIER}"           
+      else
+        export RELEASE_IDENIFIER='SNAPSHOT'
+        echo "Keeping Current version :- ${RELEASE_IDENIFIER}"                      
+      fi
+    - echo "RELEASE_IDENIFIER=${RELEASE_IDENIFIER}" >> build.env
+    - cat build.env
+
+
+Export:
+  stage: export
+  script:
+    - ls
+    - echo RD :- "$RELEASE_IDENIFIER"
+
+pullandexport:
+  stage: pullandexport
+  image: $DOCKER_REGISTRY/$DEFAULT_DOCKER_REPO/$DOCKER_IMAGE_TAG
+  services:
+    - docker:dind
+  before_script:
+    - >
+      if [ "${CI_COMMIT_BRANCH}" == 'main' ]; then
+        export AWS_ACCESS_KEY_ID_CUSTOM=$AWS_ACCESS_KEY_ID_PROD
+        export AWS_SECRET_ACCESS_KEY_CUSTOM=$AWS_SECRET_ACCESS_KEY_PROD
+        export AWSECR_REGISTRY_CUSTOM=$AWSECR_REGISTRY_PROD
+        export RELEASE_IDENIFIER='latest'
+        echo "AWSECR REGISTRY :- ${AWSECR_REGISTRY_CUSTOM}"
+      elif [[ "${CI_COMMIT_BRANCH}" == 'release/uat' ]]; then
+          export AWS_ACCESS_KEY_ID_CUSTOM=$AWS_ACCESS_KEY_ID_UAT
+          export AWS_SECRET_ACCESS_KEY_CUSTOM=$AWS_SECRET_ACCESS_KEY_UAT
+          export AWSECR_REGISTRY_CUSTOM=$AWSECR_REGISTRY_UAT
+          export RELEASE_IDENIFIER='RELEASE-BETA'
+          echo "AWSECR REGISTRY :- ${AWSECR_REGISTRY_CUSTOM}" 
+      elif [[ "${CI_COMMIT_BRANCH}" == 'release/sit' ]]; then
+          export AWS_ACCESS_KEY_ID_CUSTOM=$AWS_ACCESS_KEY_ID_SIT
+          export AWS_SECRET_ACCESS_KEY_CUSTOM=$AWS_SECRET_ACCESS_KEY_SIT
+          export AWSECR_REGISTRY_CUSTOM=$AWSECR_REGISTRY_SIT
+          export RELEASE_IDENIFIER='RELEASE'
+          echo "AWSECR REGISTRY :- ${AWSECR_REGISTRY_CUSTOM}"    
+      elif [[ "${CI_COMMIT_BRANCH}" =~ ^test\/uat.*$ ]]; then
+          export AWS_ACCESS_KEY_ID_CUSTOM=$AWS_ACCESS_KEY_ID_DEV
+          export AWS_SECRET_ACCESS_KEY_CUSTOM=$AWS_SECRET_ACCESS_KEY_DEV
+          export AWSECR_REGISTRY_CUSTOM=$AWSECR_REGISTRY_DEV
+          export RELEASE_IDENIFIER='SNAPSHOT'
+          echo "AWSECR REGISTRY :- ${AWSECR_REGISTRY_CUSTOM}"    
+      elif [[ "${CI_COMMIT_BRANCH}" == 'develop' ]]; then
+          export AWS_ACCESS_KEY_ID_CUSTOM=$AWS_ACCESS_KEY_ID_DEV
+          export AWS_SECRET_ACCESS_KEY_CUSTOM=$AWS_SECRET_ACCESS_KEY_DEV
+          export AWSECR_REGISTRY_CUSTOM=$AWSECR_REGISTRY_DEV
+          export RELEASE_IDENIFIER='SNAPSHOT'
+          echo "AWSECR REGISTRY :- ${AWSECR_REGISTRY_CUSTOM}"  
+      else
+        echo "Environment condition not matching"
+        #exit;                    
+      fi 
+    - alias aws='docker run --rm -v ~/.aws:/root/.aws -v $(pwd):/aws $DOCKER_REGISTRY/$DOCKER_NONPROD_REPO/amazon/aws-cli'
+    # Configure AWS Credentials as we are running DIND
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID_CUSTOM
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY_CUSTOM
+    - aws configure set region $AWS_DEFAULT_REGION
+    # Obtain Password and Login to ECR
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login -u AWS --password-stdin $AWSECR_REGISTRY_CUSTOM
+
+  script:
+    # Docker Login to JFrog Docker Registery
+    - docker login -u $ARTIFACTORY_USER -p $ARTIFACTORY_PASS $ARTIFACTORY_URL
+    #Read imagename from file
+    - ls
+    - >
+      while read -r line
+        do
+          #Reading line 
+          echo Image name - "$line"
+          docker pull $DOCKER_REGISTRY/$DOCKER_NONPROD_REPO/$PRODUCT_NAMESPACE/"$line"
+          #verify image
+          docker images | grep "$line"
+          #tag to AWS ECR
+          docker tag $DOCKER_REGISTRY/$DOCKER_NONPROD_REPO/$PRODUCT_NAMESPACE/"$line" $AWSECR_REGISTRY_CUSTOM/"$line" 
+          # Push images to ECR
+          docker push $AWSECR_REGISTRY_CUSTOM/"$line"
+      done < imagefile
+    # Pull from nonProd
+    
+  only:
+    - develop
+    - /^release\/.*$/
+    - /^test\/.*$/
+    - main
+  when: manual
