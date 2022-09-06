@@ -1,0 +1,105 @@
+variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+    MAVEN_CLI_OPTS: "-s settings.xml" # dependencies mentioned to add while building artifacts
+    MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+    IMAGE_TAG: ${CI_COMMIT_REF_SLUG}_${CI_COMMIT_SHORT_SHA} #???
+    IMAGE_NAME: $CI_REGISTRY_IMAGE:$IMAGE_TAG #Name of the container registry of the project #image tag
+    DOCKER_REGISTRY: 1234567.dkr.ecr.us-east-1.amazonaws.com #Destination for artifact storage at ECR
+    AWS_DEFAULT_REGION: us-east-1 #Location of aws resource
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+  
+  stages:
+    - test
+    - sonarcloud-check
+    - build
+    - deploy-to-registry
+    - export-to-ecr
+  
+  .sast:  # ???
+    stage: test
+  include:
+   - template: Security/SAST.gitlab-ci.yml
+  
+  .sonarcloud-check:  #Code scanning
+    stage: sonarcloud-check
+    image: maven:3.6.3-jdk-11
+    allow_failure: true
+    cache:
+     - key: "sonar-cache"
+       paths:
+        - .sonar/cache
+     - key: "maven-cache"
+       paths:
+        - .m2/repository
+    script:
+      - mvn ${MAVEN_CLI_OPTS} verify sonar:sonar -Dsonar.projectKey=${CI_PROJECT_ROOT_NAMESPACE}_${CI_PROJECT_NAME}
+    only:                     #tigger on
+      - /^release\/.*$/       #branches which has name *release*
+      - feature/pipelinetest  #branches with name feature/pipelinetest
+  
+  maven-build:    #BUILD stage
+    stage: build
+    image: maven:3.6-jdk-11
+    cache:
+      key: "maven-cache"
+      paths:
+        - .m2/repository
+    script: "mvn clean package -B" #build, validate proj, compile & package
+    artifacts:  #location of artifacts
+      paths:
+        - target/*.jar 
+    only:
+      - /^release\/.*$/
+      - dev
+  
+  deploy-to-package-registry: #Move artifacts to package registry
+    stage: deploy-to-registry
+    image: maven:3.6-jdk-11
+    cache:
+      key: "maven-cache"
+      paths:
+        - .m2/repository
+    script:
+      - mvn deploy ${MAVEN_CLI_OPTS} ## runs the deploy plugin which deploys an artifact to the remote package registry.
+    only:
+      - /^release\/.*$/
+      - dev
+  
+  deploy-to-container-registry: #Artifacts build as container image
+    stage: deploy-to-registry
+    image: docker:19.03.12
+    services:
+      - docker:19.03.12-dind
+    before_script:
+      - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    script:
+      - docker build -t $IMAGE_NAME .
+      - docker push $IMAGE_NAME
+    only:
+      - /^release\/.*$/
+      - dev
+  
+  export-to-ecr: #Artifacts build as container image & exporting it to ECR
+    stage: export-to-ecr
+    image: docker:19.03.12
+    services:
+      - docker:19.03.12-dind
+    before_script:
+      - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY #jfrog reg login
+      - docker pull $IMAGE_NAME #pull from jfrog after scan
+      - docker logout $CI_REGISTRY  
+      - apk add --no-cache curl jq python3 py3-pip
+      - pip install awscli
+      - aws ecr get-login-password | docker login --username AWS --password-stdin $DOCKER_REGISTRY
+      - aws ecr describe-repositories --repository-names $CI_PROJECT_NAME || aws ecr create-repository --repository-name $CI_PROJECT_NAME
+    script:
+      - docker tag $IMAGE_NAME $DOCKER_REGISTRY/$CI_PROJECT_NAME:$IMAGE_TAG #retag as required in ECR
+      - docker push $DOCKER_REGISTRY/$CI_PROJECT_NAME:$IMAGE_TAG 
+    only:
+      - /^release\/.*$/
+      - dev
+  
+  
