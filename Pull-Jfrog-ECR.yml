@@ -1,0 +1,83 @@
+variables:
+  GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by analysis task
+  PRODUCT_NAMESPACE: "test"
+  DEFAULT_DOCKER_REPO: "${DOCKER_NONPROD_REPO}"
+
+stages:
+  - pullandexport
+
+
+PullAndExport:
+  stage: pullandexport
+  image: $DOCKER_REGISTRY/$DEFAULT_DOCKER_REPO/$DOCKER_IMAGE_TAG
+  services:
+    - docker:dind
+  #variables:
+     #AWS_ACCESS_KEY_ID_CUSTOM: $AWS_ACCESS_KEY_ID_$AWSENV_M
+     #AWS_SECRET_ACCESS_KEY_CUSTOM: $AWS_SECRET_ACCESS_KEY_$AWSENV_M
+     #AWSECR_REGISTRY_CUSTOM: $AWSECR_REGISTRY_$AWSENV_M
+  before_script:
+    - echo Product IName :- "$FROM-IMG"
+    - echo Pulling :- $DOCKER_REGISTRY/$DOCKER_NONPROD_REPO/$PRODUCT_NAMESPACE/"$FROM-IMG"
+    - echo Demant  IName :- "$TO-IMG"
+    - echo RD :- "$RELEASE_IDENIFIER"
+    #- echo AWS Env :- "${AWSENV_M}"
+    #- echo Pushing :- $AWSECR_REGISTRY_CUSTOM/"$TO-IMG"
+    # Docker Login to JFrog Docker Registery
+    - docker login -u $ARTIFACTORY_USER -p $ARTIFACTORY_PASS $ARTIFACTORY_URL
+    # Read imagename from file
+    - >
+      while read -r line; do
+        echo "$line"
+    # Pull from nonProd
+    - docker pull $DOCKER_REGISTRY/$DOCKER_NONPROD_REPO/$PRODUCT_NAMESPACE/"$FROM-IMG"
+    # Pull AWS CLI Image
+    - docker pull $DOCKER_REGISTRY/$DOCKER_NONPROD_REPO/amazon/aws-cli:latest
+    - docker images
+    - >
+      if [ "${CI_COMMIT_BRANCH}" == 'main' ]; then
+        export AWS_ACCESS_KEY_ID_CUSTOM=$AWS_ACCESS_KEY_ID_PROD
+        export AWS_SECRET_ACCESS_KEY_CUSTOM=$AWS_SECRET_ACCESS_KEY_PROD
+        export AWSECR_REGISTRY_CUSTOM=$AWSECR_REGISTRY_PROD
+        export RELEASE_IDENIFIER='latest'
+        echo "AWSECR REGISTRY :- ${AWSECR_REGISTRY_CUSTOM}"
+      elif [[ "${CI_COMMIT_BRANCH}" == 'release/uat' ]]; then
+          export AWS_ACCESS_KEY_ID_CUSTOM=$AWS_ACCESS_KEY_ID_UAT
+          export AWS_SECRET_ACCESS_KEY_CUSTOM=$AWS_SECRET_ACCESS_KEY_UAT
+          export AWSECR_REGISTRY_CUSTOM=$AWSECR_REGISTRY_UAT
+          export RELEASE_IDENIFIER='RELEASE-BETA'
+          echo "AWSECR REGISTRY :- ${AWSECR_REGISTRY_CUSTOM}" 
+      elif [[ "${CI_COMMIT_BRANCH}" == 'release/sit' ]]; then
+          export AWS_ACCESS_KEY_ID_CUSTOM=$AWS_ACCESS_KEY_ID_SIT
+          export AWS_SECRET_ACCESS_KEY_CUSTOM=$AWS_SECRET_ACCESS_KEY_SIT
+          export AWSECR_REGISTRY_CUSTOM=$AWSECR_REGISTRY_SIT
+          export RELEASE_IDENIFIER='RELEASE'
+          echo "AWSECR REGISTRY :- ${AWSECR_REGISTRY_CUSTOM}"
+      elif [[ "${CI_COMMIT_BRANCH}" == 'develop' ]]; then
+          export AWS_ACCESS_KEY_ID_CUSTOM=$AWS_ACCESS_KEY_ID_DEV
+          export AWS_SECRET_ACCESS_KEY_CUSTOM=$AWS_SECRET_ACCESS_KEY_DEV
+          export AWSECR_REGISTRY_CUSTOM=$AWSECR_REGISTRY_DEV
+          export RELEASE_IDENIFIER='SNAPSHOT'
+          echo "AWSECR REGISTRY :- ${AWSECR_REGISTRY_CUSTOM}"  
+      else
+        echo "Environment condition not matching"
+        #exit;                    
+      fi 
+    - alias aws='docker run --rm -v ~/.aws:/root/.aws -v $(pwd):/aws $DOCKER_REGISTRY/$DOCKER_NONPROD_REPO/amazon/aws-cli'
+    # Configure AWS Credentials as we are running DIND
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID_CUSTOM
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY_CUSTOM
+    - aws configure set region $AWS_DEFAULT_REGION
+    # Obtain Password and Login to ECR
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login -u AWS --password-stdin $AWSECR_REGISTRY_CUSTOM
+  script:
+    # Create Tag for ECR 
+    - docker tag $DOCKER_REGISTRY/$DOCKER_NONPROD_REPO/$PRODUCT_NAMESPACE/"$FROM-IMG" $AWSECR_REGISTRY_CUSTOM/"$TO-IMG":"$RELEASE_IDENIFIER"
+    - docker images
+    # Push images to ECR
+    - docker push $AWSECR_REGISTRY_CUSTOM/"$TO-IMG":"$RELEASE_IDENIFIER"
+  only:
+    - develop
+    - /^release\/.*$/
+    - main
+  when: manual
